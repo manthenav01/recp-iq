@@ -1,41 +1,33 @@
-"use client";
-
 import { useCallback, useState } from "react";
 import { useDropzone } from "react-dropzone";
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { storage } from "@/lib/firebase";
 import { useAuth } from "@/components/auth-provider";
 import { processReceipt } from "@/app/actions/scan-receipt";
-import { Loader2, UploadCloud, FileText, CheckCircle, AlertCircle } from "lucide-react";
+import { Loader2, UploadCloud, CheckCircle, AlertCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 
 export function UploadDropzone({ onUploadComplete }: { onUploadComplete?: () => void }) {
     const { user } = useAuth();
-    const [uploading, setUploading] = useState(false);
-    const [processing, setProcessing] = useState(false);
-    const [status, setStatus] = useState<"idle" | "uploading" | "processing" | "success" | "error">("idle");
+    const [status, setStatus] = useState<"idle" | "uploading" | "processing" | "success" | "error" | "converting">("idle");
     const [errorMessage, setErrorMessage] = useState("");
 
-    const onDrop = useCallback(async (acceptedFiles: File[]) => {
+    // Helper to upload blob directly
+    const uploadBlob = async (fileToUpload: File) => {
         if (!user) return;
-        const file = acceptedFiles[0];
-        if (!file) return;
 
         setStatus("uploading");
-        setUploading(true);
+        const fileName = `${Date.now()}_${fileToUpload.name.replace(/\.[^/.]+$/, "")}.jpg`;
 
         try {
             // 1. Upload to Firebase Storage
-            const storageRef = ref(storage, `receipts/${user.uid}/${Date.now()}_${file.name}`);
-            await uploadBytes(storageRef, file);
+            const storageRef = ref(storage, `receipts/${user.uid}/${fileName}`);
+            await uploadBytes(storageRef, fileToUpload);
             const url = await getDownloadURL(storageRef);
 
             // 2. Process with AI
             setStatus("processing");
-            setProcessing(true);
-            setUploading(false);
-
             const result = await processReceipt(url, user.uid);
 
             if (result.success) {
@@ -44,20 +36,62 @@ export function UploadDropzone({ onUploadComplete }: { onUploadComplete?: () => 
             } else {
                 throw new Error(result.error);
             }
-
         } catch (error: unknown) {
             console.error(error);
             setStatus("error");
-            setErrorMessage((error as Error).message || "Something went wrong");
-        } finally {
-            setProcessing(false);
-            setUploading(false);
+            setErrorMessage((error as Error).message || "Something went wrong during upload");
         }
-    }, [user, onUploadComplete]);
+    };
+
+    const onDrop = useCallback(async (acceptedFiles: File[]) => {
+        if (!user) return;
+        let file = acceptedFiles[0];
+        if (!file) return;
+
+        console.log("File dropped:", file.name);
+
+        // Handle HEIC
+        if (file.type === "image/heic" || file.name.toLowerCase().endsWith(".heic")) {
+            setStatus("converting");
+            try {
+                const heic2any = (await import("heic2any")).default;
+                const cleanBlob = new Blob([file], { type: "image/heic" });
+                const convertedBlob = await heic2any({ blob: cleanBlob, toType: "image/jpeg", quality: 0.8 });
+                const blob = Array.isArray(convertedBlob) ? convertedBlob[0] : convertedBlob;
+                file = new File([blob], file.name.replace(/\.heic$/i, ".jpg"), { type: "image/jpeg" });
+            } catch (e: any) {
+                console.error("Client-side HEIC conversion failed", e);
+                // Fallback
+                if (e?.code === 2 || e?.message?.includes("not supported") || e?.message?.includes("ERR_LIBHEIF")) {
+                    try {
+                        const formData = new FormData();
+                        formData.append("file", file);
+                        const res = await fetch("/api/heic-convert", { method: "POST", body: formData });
+                        if (!res.ok) throw new Error("Server fail");
+                        const blob = await res.blob();
+                        file = new File([blob], file.name.replace(/\.heic$/i, ".jpg"), { type: "image/jpeg" });
+                    } catch (serverErr) {
+                        console.error("Server conversion failed", serverErr);
+                        setErrorMessage("Could not process this image format.");
+                        setStatus("error");
+                        return;
+                    }
+                } else {
+                    setErrorMessage("Image conversion failed.");
+                    setStatus("error");
+                    return;
+                }
+            }
+        }
+
+        // Auto-upload immediately
+        uploadBlob(file);
+
+    }, [user, onUploadComplete]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const { getRootProps, getInputProps, isDragActive } = useDropzone({
         onDrop,
-        accept: { 'image/*': ['.png', '.jpg', '.jpeg', '.webp'] },
+        accept: { 'image/*': ['.png', '.jpg', '.jpeg', '.webp', '.heic'] },
         maxFiles: 1
     });
 
@@ -99,17 +133,23 @@ export function UploadDropzone({ onUploadComplete }: { onUploadComplete?: () => 
                                 <h3 className="font-semibold text-slate-900 dark:text-white">Receipt Processed!</h3>
                                 <p className="text-sm text-slate-500">Your data has been extracted successfully.</p>
                             </div>
-                            <Button variant="outline" onClick={() => setStatus("idle")}>Scan Another</Button>
+                            <Button variant="outline" onClick={() => { setStatus("idle"); }}>
+                                Scan Another
+                            </Button>
                         </>
                     ) : (
                         <>
                             <Loader2 className="h-10 w-10 animate-spin text-blue-600" />
                             <div>
                                 <h3 className="font-semibold text-slate-900 dark:text-white">
-                                    {status === "uploading" ? "Uploading Image..." : "AI Analyzing Receipt..."}
+                                    {status === "uploading" ? "Uploading Image..." :
+                                        status === "converting" ? "Optimizing Image..." :
+                                            "Analyzing Receipt..."}
                                 </h3>
                                 <p className="text-sm text-slate-500">
-                                    {status === "uploading" ? "Please wait while we secure your file." : "Extracting items, date, and total."}
+                                    {status === "uploading" ? "Please wait while we secure your file." :
+                                        status === "converting" ? "Enhancing quality for better accuracy." :
+                                            "Extracting items, date, and total."}
                                 </p>
                             </div>
                         </>
